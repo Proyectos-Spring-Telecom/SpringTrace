@@ -40,6 +40,11 @@ import Joi from 'joi';
         GATEWAY_FOTOS_DIR: Joi.string().optional().default('./fotos'),
         GATEWAY_CAPTURE_TIMEOUT_MS: Joi.number().optional().default(30000),
         GATEWAY_UPLOAD_TIMEOUT: Joi.number().optional().default(30000),
+        GATEWAY_MEDIA_QUERY_TIMEOUT: Joi.number().optional().default(15000),
+        GATEWAY_DEFAULT_TERMINAL_ID: Joi.string()
+          .pattern(/^\d{12}$/)
+          .optional()
+          .default('007773050481'),
       }),
     }),
 

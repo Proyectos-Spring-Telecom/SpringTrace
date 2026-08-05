@@ -1,6 +1,14 @@
-import { Body, Controller, HttpCode, HttpStatus, Post } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  HttpCode,
+  HttpStatus,
+  Post,
+} from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { CapturePhotoDto } from './dto/capture-photo.dto';
+import { FetchMediaDto } from './dto/fetch-media.dto';
 import { GatewayService } from './gateway.service';
 
 /**
@@ -24,5 +32,30 @@ export class GatewayController {
       body.channelId ?? 2,
       body.saveFlag ?? 1,
     );
+  }
+
+  @Get('status')
+  @ApiOperation({
+    summary: 'Consultar sesiones JT808, colas y multimedia pendientes',
+  })
+  status() {
+    return this.gatewayService.getStatus();
+  }
+
+  @Get('media/list')
+  @ApiOperation({
+    summary: 'Consultar imágenes almacenadas en la dashcam (0x8802/0x0802)',
+  })
+  mediaList() {
+    return this.gatewayService.queryStoredMedia();
+  }
+
+  @Post('media/fetch')
+  @HttpCode(HttpStatus.ACCEPTED)
+  @ApiOperation({
+    summary: 'Solicitar descarga de un multimedia almacenado (0x8805)',
+  })
+  mediaFetch(@Body() body: FetchMediaDto) {
+    return this.gatewayService.requestMediaFetch(body.multimediaId);
   }
 }

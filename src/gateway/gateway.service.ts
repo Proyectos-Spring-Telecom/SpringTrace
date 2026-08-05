@@ -1,5 +1,6 @@
 import {
   ConflictException,
+  GatewayTimeoutException,
   Injectable,
   Logger,
   OnModuleDestroy,
@@ -12,6 +13,12 @@ import * as path from 'path';
 import { CaptureLoggerService } from './capture-logger.service';
 import { HistoricoLoggerService } from './historico-logger.service';
 import { parseLocation } from './jt808.location';
+import {
+  buildStoredMediaQueryBody,
+  parseStoredMediaQueryResponse,
+  parseTerminalGeneralResponse,
+  StoredMediaItem,
+} from './jt808.media-query';
 import {
   buildCameraShootBody,
   buildMultimediaUploadAck,
@@ -30,24 +37,32 @@ import {
 } from './jt808.codec';
 
 const MESSAGE_NAMES: Record<number, string> = {
+  0x0001: 'Respuesta genérica del terminal',
   0x0002: 'Heartbeat',
   0x0100: 'Registro',
   0x0102: 'Autenticación',
   0x0200: 'Posición GPS',
   0x0704: 'Posiciones en lote',
   0x0801: 'Subida multimedia',
+  0x0802: 'Respuesta consulta multimedia',
   0x0805: 'Respuesta control cámara',
   0x8001: 'Respuesta genérica de plataforma',
   0x8100: 'Respuesta de registro',
   0x8800: 'ACK subida multimedia',
   0x8801: 'Control inmediato de cámara',
+  0x8802: 'Consulta multimedia almacenado',
   0x8805: 'Solicitar multimedia almacenado',
 };
 
 interface ConnectionState {
   decoder: Jt808FrameDecoder;
   terminalId?: string;
-  authenticated: boolean;
+}
+
+interface QueuedCaptureCommand {
+  channelId: number;
+  saveFlag: 0 | 1;
+  queuedAt: Date;
 }
 
 interface PendingCameraCommand {
@@ -61,7 +76,28 @@ interface PendingMultimediaUpload {
   terminalId: string;
   multimediaId: number;
   strategy: 'stored-0x8805' | 'immediate';
+  status: 'awaiting' | 'receiving';
+  timeout: NodeJS.Timeout | null;
+  requestedAt: Date;
+}
+
+interface PendingMediaQuery {
+  serialNumber: number;
   timeout: NodeJS.Timeout;
+  resolve: (items: StoredMediaItem[]) => void;
+  reject: (error: Error) => void;
+}
+
+interface TerminalSession {
+  terminalId: string;
+  socket: net.Socket | null;
+  authenticated: boolean;
+  remoteAddress: string | null;
+  lastSeen: Date;
+  commandQueue: QueuedCaptureCommand[];
+  pendingMultimedia: Map<number, PendingMultimediaUpload>;
+  storedMedia: StoredMediaItem[];
+  pendingMediaQuery: PendingMediaQuery | null;
 }
 
 interface PendingBodyAssembly {
@@ -80,15 +116,14 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
   private readonly fotosDir: string;
   private readonly captureTimeoutMs: number;
   private readonly uploadTimeoutMs: number;
+  private readonly mediaQueryTimeoutMs: number;
+  private readonly defaultTerminalId: string;
   private readonly tokens = new Map<string, string>();
   private readonly connections = new Map<net.Socket, ConnectionState>();
+  private readonly terminalSessions = new Map<string, TerminalSession>();
   private readonly pendingCameraCommands = new Map<
     number,
     PendingCameraCommand
-  >();
-  private readonly pendingMultimediaUploads = new Map<
-    string,
-    PendingMultimediaUpload
   >();
   private readonly bodyAssemblies = new Map<string, PendingBodyAssembly>();
   private server: net.Server | null = null;
@@ -107,6 +142,14 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
       30000;
     this.uploadTimeoutMs =
       this.configService.get<number>('GATEWAY_UPLOAD_TIMEOUT', 30000) ?? 30000;
+    this.mediaQueryTimeoutMs =
+      this.configService.get<number>('GATEWAY_MEDIA_QUERY_TIMEOUT', 15000) ??
+      15000;
+    this.defaultTerminalId =
+      this.configService.get<string>(
+        'GATEWAY_DEFAULT_TERMINAL_ID',
+        '007773050481',
+      ) ?? '007773050481';
 
     const configuredFotos =
       this.configService.get<string>('GATEWAY_FOTOS_DIR') ?? './fotos';
@@ -116,6 +159,8 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
   }
 
   onModuleInit(): void {
+    this.getOrCreateSession(this.defaultTerminalId);
+
     try {
       fs.mkdirSync(this.fotosDir, { recursive: true });
       this.logger.log(`Carpeta de fotos: ${this.fotosDir}`);
@@ -148,10 +193,21 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
       clearTimeout(pending.timeout);
     }
     this.pendingCameraCommands.clear();
-    for (const pending of this.pendingMultimediaUploads.values()) {
-      clearTimeout(pending.timeout);
+    for (const session of this.terminalSessions.values()) {
+      for (const pending of session.pendingMultimedia.values()) {
+        if (pending.timeout) {
+          clearTimeout(pending.timeout);
+        }
+      }
+      if (session.pendingMediaQuery) {
+        clearTimeout(session.pendingMediaQuery.timeout);
+        session.pendingMediaQuery.reject(
+          new Error('Gateway detenido durante consulta multimedia'),
+        );
+        session.pendingMediaQuery = null;
+      }
     }
-    this.pendingMultimediaUploads.clear();
+    this.terminalSessions.clear();
     this.bodyAssemblies.clear();
 
     for (const socket of this.connections.keys()) {
@@ -177,66 +233,208 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
     });
   }
 
-  /**
-   * Dispara 0x8801 a la primera cámara autenticada conectada.
-   * Endpoint de prueba: sin JWT.
-   */
+  /** Envía ahora o encola por terminalId; siempre es aceptada por HTTP. */
   requestPhotoCapture(
     channelId = 2,
     saveFlag: 0 | 1 = 1,
   ): {
     message: string;
+    status: 'sent' | 'queued';
     terminalId: string;
     channelId: number;
     saveFlag: 0 | 1;
     strategy: 'stored-0x8805' | 'immediate';
-    platformSerial: number;
+    platformSerial: number | null;
   } {
-    const connected = this.findAuthenticatedConnection();
-    if (!connected) {
+    const session = this.selectTargetSession();
+    const strategy = saveFlag === 1 ? 'stored-0x8805' : 'immediate';
+
+    if (!session.authenticated || !session.socket || session.socket.destroyed) {
+      session.commandQueue.push({ channelId, saveFlag, queuedAt: new Date() });
+      this.logger.warn(
+        `Captura encolada: terminal=${session.terminalId}, canal=${channelId}, ` +
+          `saveFlag=${saveFlag}, cola=${session.commandQueue.length}`,
+      );
+
+      return {
+        message: 'captura encolada; se enviará al autenticarse la cámara',
+        status: 'queued',
+        terminalId: session.terminalId,
+        channelId,
+        saveFlag,
+        strategy,
+        platformSerial: null,
+      };
+    }
+
+    try {
+      const platformSerial = this.sendCaptureCommand(
+        session,
+        channelId,
+        saveFlag,
+      );
+
+      return {
+        message: 'captura solicitada',
+        status: 'sent',
+        terminalId: session.terminalId,
+        channelId,
+        saveFlag,
+        strategy,
+        platformSerial,
+      };
+    } catch (error) {
+      session.authenticated = false;
+      session.commandQueue.push({ channelId, saveFlag, queuedAt: new Date() });
+      const detail = error instanceof Error ? error.message : String(error);
+      this.logger.warn(
+        `No se pudo enviar captura; quedó en cola: terminal=${session.terminalId}, ` +
+          `error=${detail}`,
+      );
+      return {
+        message: 'captura encolada; se enviará al autenticarse la cámara',
+        status: 'queued',
+        terminalId: session.terminalId,
+        channelId,
+        saveFlag,
+        strategy,
+        platformSerial: null,
+      };
+    }
+  }
+
+  async queryStoredMedia(): Promise<{
+    terminalId: string;
+    totalItems: number;
+    items: Array<StoredMediaItem & { multimediaIdHex: string }>;
+  }> {
+    const session = this.selectTargetSession();
+    if (!session.authenticated || !session.socket || session.socket.destroyed) {
       throw new ConflictException(
-        'No hay ninguna dashcam autenticada conectada al gateway TCP',
+        `Terminal ${session.terminalId} no está autenticado`,
+      );
+    }
+    if (session.pendingMediaQuery) {
+      throw new ConflictException(
+        `Ya existe una consulta multimedia pendiente para ${session.terminalId}`,
       );
     }
 
-    const strategy = saveFlag === 1 ? 'stored-0x8805' : 'immediate';
-    const body = buildCameraShootBody({ channelId, saveFlag });
-    const platformSerial = this.send(
-      connected.socket,
-      0x8801,
-      connected.terminalId,
-      body,
-      `captura solicitada canal=${channelId}, estrategia=${strategy}`,
-    );
+    const items = await new Promise<StoredMediaItem[]>((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        session.pendingMediaQuery = null;
+        reject(
+          new GatewayTimeoutException(
+            `Sin respuesta 0x0802 tras ${this.mediaQueryTimeoutMs}ms`,
+          ),
+        );
+      }, this.mediaQueryTimeoutMs);
 
-    this.armCaptureTimeout(
-      platformSerial,
-      connected.terminalId,
-      channelId,
-      saveFlag,
-    );
+      session.pendingMediaQuery = {
+        serialNumber: 0,
+        timeout,
+        resolve,
+        reject,
+      };
 
-    this.logger.log(
-      `Captura solicitada: terminal=${connected.terminalId}, ` +
-        `canal=${channelId}, saveFlag=${saveFlag}, estrategia=${strategy}, ` +
-        `serialPlataforma=${platformSerial}`,
-    );
+      try {
+        this.sendStoredMediaQuery(session);
+      } catch (error) {
+        clearTimeout(timeout);
+        session.pendingMediaQuery = null;
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
 
     return {
-      message: 'captura solicitada',
-      terminalId: connected.terminalId,
-      channelId,
-      saveFlag,
-      strategy,
-      platformSerial,
+      terminalId: session.terminalId,
+      totalItems: items.length,
+      items: items.map((item) => ({
+        ...item,
+        multimediaIdHex: `0x${item.multimediaId.toString(16).padStart(8, '0')}`,
+      })),
     };
+  }
+
+  requestMediaFetch(multimediaId: number): {
+    message: string;
+    status: 'sent' | 'queued';
+    terminalId: string;
+    multimediaId: number;
+    multimediaIdHex: string;
+  } {
+    const session = this.selectTargetSession();
+    const connected =
+      session.authenticated &&
+      session.socket !== null &&
+      !session.socket.destroyed;
+
+    let sent = connected;
+    try {
+      this.sendStoredUploadRequest(session, multimediaId);
+    } catch (error) {
+      sent = false;
+      session.authenticated = false;
+      const detail = error instanceof Error ? error.message : String(error);
+      this.logger.warn(
+        `No se pudo enviar 0x8805; quedó pendiente: ` +
+          `terminal=${session.terminalId}, multimediaId=${multimediaId}, ` +
+          `error=${detail}`,
+      );
+    }
+
+    return {
+      message: sent
+        ? 'solicitud de subida enviada'
+        : 'solicitud encolada; se enviará al autenticarse la cámara',
+      status: sent ? 'sent' : 'queued',
+      terminalId: session.terminalId,
+      multimediaId,
+      multimediaIdHex: `0x${multimediaId.toString(16).padStart(8, '0')}`,
+    };
+  }
+
+  getStatus(): Array<{
+    terminalId: string;
+    authenticated: boolean;
+    remoteAddress: string | null;
+    lastSeen: string;
+    queuedCommands: number;
+    storedMediaItems: number;
+    mediaQueryPending: boolean;
+    pendingMultimedia: Array<{
+      multimediaId: number;
+      status: 'awaiting' | 'receiving';
+      strategy: 'stored-0x8805' | 'immediate';
+      requestedAt: string;
+    }>;
+  }> {
+    return [...this.terminalSessions.values()].map((session) => ({
+      terminalId: session.terminalId,
+      authenticated:
+        session.authenticated &&
+        session.socket !== null &&
+        !session.socket.destroyed,
+      remoteAddress: session.remoteAddress,
+      lastSeen: session.lastSeen.toISOString(),
+      queuedCommands: session.commandQueue.length,
+      storedMediaItems: session.storedMedia.length,
+      mediaQueryPending: session.pendingMediaQuery !== null,
+      pendingMultimedia: [...session.pendingMultimedia.values()].map(
+        (pending) => ({
+          multimediaId: pending.multimediaId,
+          status: pending.status,
+          strategy: pending.strategy,
+          requestedAt: pending.requestedAt.toISOString(),
+        }),
+      ),
+    }));
   }
 
   private handleConnection(socket: net.Socket): void {
     const remote = this.remoteAddress(socket);
     this.connections.set(socket, {
       decoder: new Jt808FrameDecoder(),
-      authenticated: false,
     });
 
     socket.setKeepAlive(true);
@@ -258,7 +456,9 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
       const terminal = state?.terminalId ?? 'desconocido';
       state?.decoder.reset();
       this.connections.delete(socket);
-      this.clearStateForTerminal(terminal);
+      if (terminal !== 'desconocido') {
+        this.handleSocketClosed(terminal, socket);
+      }
       this.logger.log(
         `Conexión TCP cerrada: terminal=${terminal}, remoto=${remote}`,
       );
@@ -305,6 +505,12 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
       }
 
       const message = parseHeader(payload);
+      state.terminalId = message.terminalId;
+      const session = this.getOrCreateSession(message.terminalId);
+      session.lastSeen = new Date();
+      if (session.socket === socket) {
+        session.remoteAddress = this.remoteAddress(socket);
+      }
       if (payload.length !== message.headerLength + message.bodyLength) {
         throw new Error(
           `Longitud de trama inconsistente: payload=${payload.length}, ` +
@@ -395,7 +601,6 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
     const assembledBody = pending.assembler.assemble();
     const state = this.connections.get(socket) ?? {
       decoder: new Jt808FrameDecoder(),
-      authenticated: false,
       terminalId: message.terminalId,
     };
 
@@ -416,6 +621,9 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
     const completeMessage: Jt808Header = { ...message, body };
 
     switch (completeMessage.messageId) {
+      case 0x0001:
+        this.handleTerminalGeneralResponse(completeMessage);
+        break;
       case 0x0100:
         this.handleRegistration(socket, state, completeMessage);
         break;
@@ -434,6 +642,9 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
       case 0x0801:
         void this.handleMultimediaUpload(socket, completeMessage);
         break;
+      case 0x0802:
+        this.handleStoredMediaQueryResponse(completeMessage);
+        break;
       default:
         this.logger.warn(
           `Mensaje no manejado aún: terminal=${completeMessage.terminalId}, ` +
@@ -448,6 +659,63 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
+  private handleTerminalGeneralResponse(message: Jt808Header): void {
+    try {
+      const response = parseTerminalGeneralResponse(message.body);
+      const log =
+        `0x0001 terminal=${message.terminalId}, ` +
+        `serialRespondido=${response.responseSerial}, ` +
+        `mensajeRespondido=${this.formatMessage(response.responseMessageId)}, ` +
+        `resultado=${response.result} (${response.resultLabel})`;
+
+      if (response.result === 0) {
+        this.logger.log(log);
+      } else {
+        this.logger.warn(log);
+      }
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`Error al parsear 0x0001: ${detail}`);
+    }
+  }
+
+  private handleStoredMediaQueryResponse(message: Jt808Header): void {
+    try {
+      const response = parseStoredMediaQueryResponse(message.body);
+      const session = this.getOrCreateSession(message.terminalId);
+      session.storedMedia = response.items;
+
+      const ids = response.items
+        .map((item) => `0x${item.multimediaId.toString(16).padStart(8, '0')}`)
+        .join(', ');
+      this.logger.log(
+        `0x0802 terminal=${message.terminalId}, total=${response.totalItems}, ` +
+          `multimediaIds=[${ids}]`,
+      );
+
+      const pending = session.pendingMediaQuery;
+      if (!pending) {
+        this.logger.warn(
+          `0x0802 sin consulta HTTP pendiente: terminal=${message.terminalId}`,
+        );
+        return;
+      }
+      if (pending.serialNumber !== response.responseSerial) {
+        this.logger.warn(
+          `0x0802 serial distinto tras reconexión: esperado=${pending.serialNumber}, ` +
+            `recibido=${response.responseSerial}; se acepta por terminalId`,
+        );
+      }
+
+      clearTimeout(pending.timeout);
+      session.pendingMediaQuery = null;
+      pending.resolve(response.items);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      this.logger.warn(`Error al parsear 0x0802: ${detail}`);
+    }
+  }
+
   private handleRegistration(
     socket: net.Socket,
     state: ConnectionState,
@@ -456,7 +724,8 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
     const token = this.createToken(message.terminalId);
     this.tokens.set(message.terminalId, token);
     state.terminalId = message.terminalId;
-    state.authenticated = false;
+    const session = this.getOrCreateSession(message.terminalId);
+    this.bindSessionSocket(session, socket, false);
 
     const body = Buffer.alloc(3 + Buffer.byteLength(token, 'ascii'));
     body.writeUInt16BE(message.serialNumber, 0);
@@ -471,14 +740,17 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
     state: ConnectionState,
     message: Jt808Header,
   ): void {
-    const expectedToken = this.tokens.get(message.terminalId);
+    const session = this.getOrCreateSession(message.terminalId);
+    const expectedToken =
+      this.tokens.get(message.terminalId) ??
+      this.createToken(message.terminalId);
     const receivedToken = message.body.toString('ascii');
-    const accepted =
-      expectedToken !== undefined && receivedToken === expectedToken;
+    const accepted = receivedToken === expectedToken;
 
     if (accepted) {
+      this.tokens.set(message.terminalId, expectedToken);
       state.terminalId = message.terminalId;
-      state.authenticated = true;
+      this.bindSessionSocket(session, socket, true);
     }
 
     this.sendGeneralResponse(
@@ -487,6 +759,10 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
       accepted ? 0x00 : 0x01,
       accepted ? 'autenticación aceptada' : 'token de autenticación inválido',
     );
+
+    if (accepted) {
+      this.drainSessionWork(session);
+    }
   }
 
   private handleLocation(socket: net.Socket, message: Jt808Header): void {
@@ -545,26 +821,16 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
           );
         }
 
+        const session = this.getOrCreateSession(message.terminalId);
         for (const multimediaId of response.multimediaIds) {
-          this.armUploadTimeout(message.terminalId, multimediaId, strategy);
-
           if (strategy === 'stored-0x8805') {
-            const uploadBody = buildStoredMultimediaUploadCommand(
-              multimediaId,
-              0,
-            );
-            this.send(
-              socket,
-              0x8805,
-              message.terminalId,
-              uploadBody,
-              `solicitar multimedia almacenado id=${multimediaId}, deleteFlag=0`,
-            );
+            this.sendStoredUploadRequest(session, multimediaId);
             this.logger.log(
               `0x8805 enviado: terminal=${message.terminalId}, ` +
                 `multimediaId=${multimediaId}, deleteFlag=0`,
             );
           } else {
+            this.armUploadTimeout(message.terminalId, multimediaId, strategy);
             this.logger.log(
               `Esperando subida inmediata 0x0801: terminal=${message.terminalId}, ` +
                 `multimediaId=${multimediaId}`,
@@ -627,6 +893,7 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
         ackBody,
         `ACK multimedia ${upload.multimediaId}`,
       );
+      this.completeMultimediaUpload(message.terminalId, upload.multimediaId);
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       this.logger.warn(
@@ -659,6 +926,14 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
 
     const timeout = setTimeout(() => {
       this.pendingCameraCommands.delete(platformSerial);
+      const session = this.terminalSessions.get(terminalId);
+      if (!session?.authenticated || !session.socket) {
+        session?.commandQueue.push({
+          channelId,
+          saveFlag,
+          queuedAt: new Date(),
+        });
+      }
       this.logger.warn(
         `Sin respuesta de captura (0x0805) tras ${this.captureTimeoutMs}ms: ` +
           `terminal=${terminalId}, canal=${channelId}, saveFlag=${saveFlag}, ` +
@@ -696,11 +971,14 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
     multimediaId: number,
     strategy: 'stored-0x8805' | 'immediate',
   ): void {
-    const key = this.multimediaKey(terminalId, multimediaId);
-    this.clearUploadTimeout(terminalId, multimediaId);
+    const session = this.getOrCreateSession(terminalId);
+    const existing = session.pendingMultimedia.get(multimediaId);
+    if (existing?.timeout) {
+      clearTimeout(existing.timeout);
+    }
 
     const timeout = setTimeout(() => {
-      this.pendingMultimediaUploads.delete(key);
+      session.pendingMultimedia.delete(multimediaId);
       this.logger.warn(
         `Sin subida de multimedia tras ${this.uploadTimeoutMs}ms: ` +
           `terminal=${terminalId}, multimediaId=${multimediaId}, ` +
@@ -708,11 +986,13 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
       );
     }, this.uploadTimeoutMs);
 
-    this.pendingMultimediaUploads.set(key, {
+    session.pendingMultimedia.set(multimediaId, {
       terminalId,
       multimediaId,
       strategy,
+      status: 'awaiting',
       timeout,
+      requestedAt: existing?.requestedAt ?? new Date(),
     });
   }
 
@@ -720,8 +1000,14 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
     terminalId: string,
     multimediaId: number,
   ): void {
-    const pending = this.clearUploadTimeout(terminalId, multimediaId);
+    const session = this.terminalSessions.get(terminalId);
+    const pending = session?.pendingMultimedia.get(multimediaId);
     if (pending) {
+      if (pending.timeout) {
+        clearTimeout(pending.timeout);
+        pending.timeout = null;
+      }
+      pending.status = 'receiving';
       this.logger.log(
         `Subida 0x0801 iniciada: terminal=${terminalId}, ` +
           `multimediaId=${multimediaId}, estrategia=${pending.strategy}`,
@@ -729,54 +1015,264 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private clearUploadTimeout(
+  private completeMultimediaUpload(
     terminalId: string,
     multimediaId: number,
-  ): PendingMultimediaUpload | undefined {
-    const key = this.multimediaKey(terminalId, multimediaId);
-    const pending = this.pendingMultimediaUploads.get(key);
-    if (!pending) {
-      return undefined;
+  ): void {
+    const session = this.terminalSessions.get(terminalId);
+    const pending = session?.pendingMultimedia.get(multimediaId);
+    if (pending?.timeout) {
+      clearTimeout(pending.timeout);
     }
-    clearTimeout(pending.timeout);
-    this.pendingMultimediaUploads.delete(key);
-    return pending;
+    session?.pendingMultimedia.delete(multimediaId);
   }
 
-  private multimediaKey(terminalId: string, multimediaId: number): string {
-    return `${terminalId}:${multimediaId}`;
+  private getOrCreateSession(terminalId: string): TerminalSession {
+    let session = this.terminalSessions.get(terminalId);
+    if (!session) {
+      session = {
+        terminalId,
+        socket: null,
+        authenticated: false,
+        remoteAddress: null,
+        lastSeen: new Date(),
+        commandQueue: [],
+        pendingMultimedia: new Map<number, PendingMultimediaUpload>(),
+        storedMedia: [],
+        pendingMediaQuery: null,
+      };
+      this.terminalSessions.set(terminalId, session);
+    }
+    return session;
   }
 
-  private clearStateForTerminal(terminalId: string): void {
+  private selectTargetSession(): TerminalSession {
+    const authenticated = [...this.terminalSessions.values()]
+      .filter(
+        (session) =>
+          session.authenticated &&
+          session.socket !== null &&
+          !session.socket.destroyed,
+      )
+      .sort((a, b) => b.lastSeen.getTime() - a.lastSeen.getTime())[0];
+
+    if (authenticated) {
+      return authenticated;
+    }
+
+    return (
+      this.terminalSessions.get(this.defaultTerminalId) ??
+      this.getOrCreateSession(this.defaultTerminalId)
+    );
+  }
+
+  private bindSessionSocket(
+    session: TerminalSession,
+    socket: net.Socket,
+    authenticated: boolean,
+  ): void {
+    const previousSocket = session.socket;
+    if (
+      previousSocket &&
+      previousSocket !== socket &&
+      !previousSocket.destroyed
+    ) {
+      this.logger.warn(
+        `Cambio de conexión 4G: terminal=${session.terminalId}, ` +
+          `anterior=${session.remoteAddress}, nueva=${this.remoteAddress(socket)}`,
+      );
+      this.requeueInflightCommands(session.terminalId);
+      this.suspendPendingUploads(session);
+      this.clearAssembliesForTerminal(session.terminalId);
+      previousSocket.destroy();
+    }
+
+    session.socket = socket;
+    session.authenticated = authenticated;
+    session.remoteAddress = this.remoteAddress(socket);
+    session.lastSeen = new Date();
+  }
+
+  private handleSocketClosed(terminalId: string, socket: net.Socket): void {
+    const session = this.terminalSessions.get(terminalId);
+    if (!session || session.socket !== socket) {
+      return;
+    }
+
+    session.socket = null;
+    session.authenticated = false;
+    session.lastSeen = new Date();
+    this.requeueInflightCommands(terminalId);
+    this.suspendPendingUploads(session);
+    this.clearAssembliesForTerminal(terminalId);
+  }
+
+  private sendCaptureCommand(
+    session: TerminalSession,
+    channelId: number,
+    saveFlag: 0 | 1,
+  ): number {
+    if (!session.socket || session.socket.destroyed) {
+      throw new Error(`Terminal ${session.terminalId} sin socket activo`);
+    }
+
+    const strategy = saveFlag === 1 ? 'stored-0x8805' : 'immediate';
+    const body = buildCameraShootBody({ channelId, saveFlag });
+    const platformSerial = this.send(
+      session.socket,
+      0x8801,
+      session.terminalId,
+      body,
+      `captura solicitada canal=${channelId}, estrategia=${strategy}`,
+    );
+
+    this.armCaptureTimeout(
+      platformSerial,
+      session.terminalId,
+      channelId,
+      saveFlag,
+    );
+    this.logger.log(
+      `Captura enviada: terminal=${session.terminalId}, canal=${channelId}, ` +
+        `saveFlag=${saveFlag}, estrategia=${strategy}, ` +
+        `serialPlataforma=${platformSerial}`,
+    );
+    return platformSerial;
+  }
+
+  private drainSessionWork(session: TerminalSession): void {
+    if (!session.authenticated || !session.socket || session.socket.destroyed) {
+      return;
+    }
+
+    while (session.commandQueue.length > 0) {
+      const command = session.commandQueue.shift()!;
+      try {
+        this.sendCaptureCommand(session, command.channelId, command.saveFlag);
+      } catch (error) {
+        session.commandQueue.unshift(command);
+        const detail = error instanceof Error ? error.message : String(error);
+        this.logger.warn(
+          `No se pudo drenar cola de terminal=${session.terminalId}: ${detail}`,
+        );
+        break;
+      }
+    }
+
+    if (session.pendingMediaQuery) {
+      try {
+        this.sendStoredMediaQuery(session);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        this.logger.warn(
+          `No se pudo reintentar consulta multimedia de ` +
+            `terminal=${session.terminalId}: ${detail}`,
+        );
+      }
+    }
+
+    for (const pending of session.pendingMultimedia.values()) {
+      try {
+        this.sendStoredUploadRequest(session, pending.multimediaId, true);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        this.logger.warn(
+          `No se pudo reintentar multimedia=${pending.multimediaId} ` +
+            `terminal=${session.terminalId}: ${detail}`,
+        );
+      }
+    }
+  }
+
+  private sendStoredMediaQuery(session: TerminalSession): void {
+    if (!session.authenticated || !session.socket || session.socket.destroyed) {
+      throw new Error(`Terminal ${session.terminalId} sin sesión autenticada`);
+    }
+    if (!session.pendingMediaQuery) {
+      throw new Error('No existe consulta multimedia pendiente');
+    }
+
+    const serialNumber = this.send(
+      session.socket,
+      0x8802,
+      session.terminalId,
+      buildStoredMediaQueryBody(),
+      'consultar todas las imágenes almacenadas',
+    );
+    session.pendingMediaQuery.serialNumber = serialNumber;
+    this.logger.log(
+      `0x8802 enviado: terminal=${session.terminalId}, serial=${serialNumber}`,
+    );
+  }
+
+  private sendStoredUploadRequest(
+    session: TerminalSession,
+    multimediaId: number,
+    reconnectRetry = false,
+  ): void {
+    const existing = session.pendingMultimedia.get(multimediaId);
+    if (!existing) {
+      session.pendingMultimedia.set(multimediaId, {
+        terminalId: session.terminalId,
+        multimediaId,
+        strategy: 'stored-0x8805',
+        status: 'awaiting',
+        timeout: null,
+        requestedAt: new Date(),
+      });
+    }
+
+    if (!session.authenticated || !session.socket || session.socket.destroyed) {
+      return;
+    }
+
+    const strategy =
+      session.pendingMultimedia.get(multimediaId)?.strategy ?? 'stored-0x8805';
+    this.armUploadTimeout(session.terminalId, multimediaId, strategy);
+    this.send(
+      session.socket,
+      0x8805,
+      session.terminalId,
+      buildStoredMultimediaUploadCommand(multimediaId, 0),
+      `${reconnectRetry ? 'reintento' : 'solicitud'} multimedia id=${multimediaId}, deleteFlag=0`,
+    );
+  }
+
+  private requeueInflightCommands(terminalId: string): void {
+    const session = this.terminalSessions.get(terminalId);
+    if (!session) {
+      return;
+    }
+
     for (const [serial, pending] of this.pendingCameraCommands) {
       if (pending.terminalId === terminalId) {
         clearTimeout(pending.timeout);
         this.pendingCameraCommands.delete(serial);
+        session.commandQueue.push({
+          channelId: pending.channelId,
+          saveFlag: pending.saveFlag,
+          queuedAt: new Date(),
+        });
       }
     }
-    for (const [key, pending] of this.pendingMultimediaUploads) {
-      if (pending.terminalId === terminalId) {
+  }
+
+  private suspendPendingUploads(session: TerminalSession): void {
+    for (const pending of session.pendingMultimedia.values()) {
+      if (pending.timeout) {
         clearTimeout(pending.timeout);
-        this.pendingMultimediaUploads.delete(key);
+        pending.timeout = null;
       }
+      pending.status = 'awaiting';
     }
+  }
+
+  private clearAssembliesForTerminal(terminalId: string): void {
     for (const [key, assembly] of this.bodyAssemblies) {
       if (assembly.terminalId === terminalId) {
         this.bodyAssemblies.delete(key);
       }
     }
-  }
-
-  private findAuthenticatedConnection(): {
-    socket: net.Socket;
-    terminalId: string;
-  } | null {
-    for (const [socket, state] of this.connections) {
-      if (state.authenticated && state.terminalId && !socket.destroyed) {
-        return { socket, terminalId: state.terminalId };
-      }
-    }
-    return null;
   }
 
   private sendGeneralResponse(
