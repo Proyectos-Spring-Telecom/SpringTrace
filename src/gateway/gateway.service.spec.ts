@@ -2,6 +2,7 @@ import { ConfigService } from '@nestjs/config';
 import { CaptureLoggerService } from './capture-logger.service';
 import { GatewayService } from './gateway.service';
 import { HistoricoLoggerService } from './historico-logger.service';
+import { MediaServerService } from './media-server.service';
 
 describe('GatewayService session queue', () => {
   it('encola captura por terminalId cuando no hay socket autenticado', () => {
@@ -14,7 +15,24 @@ describe('GatewayService session queue', () => {
     const historicoLogger = {
       logLocation: jest.fn(),
     } as unknown as HistoricoLoggerService;
-    const service = new GatewayService(config, captureLogger, historicoLogger);
+    const mediaServer = {
+      expectConnection: jest.fn(),
+      stopCapture: jest.fn(),
+      getStatus: jest.fn().mockReturnValue({
+        listening: false,
+        port: 9002,
+        activeConnection: false,
+        packets: 0,
+        bytes: 0,
+        jt1078MarkerSeen: false,
+      }),
+    } as unknown as MediaServerService;
+    const service = new GatewayService(
+      config,
+      captureLogger,
+      historicoLogger,
+      mediaServer,
+    );
 
     const result = service.requestPhotoCapture();
     const status = service.getStatus();

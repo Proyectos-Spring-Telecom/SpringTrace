@@ -45,6 +45,10 @@ import Joi from 'joi';
           .pattern(/^\d{12}$/)
           .optional()
           .default('007773050481'),
+        GATEWAY_MEDIA_IP: Joi.string().optional().default('216.238.70.193'),
+        GATEWAY_MEDIA_PORT: Joi.number().optional().default(9002),
+        GATEWAY_VIDEO_DIR: Joi.string().optional().default('./video'),
+        GATEWAY_VIDEO_TIMEOUT: Joi.number().optional().default(30000),
       }),
     }),
 

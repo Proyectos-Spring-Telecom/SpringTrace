@@ -9,11 +9,11 @@ import {
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { CapturePhotoDto } from './dto/capture-photo.dto';
 import { FetchMediaDto } from './dto/fetch-media.dto';
+import { StartVideoDto } from './dto/start-video.dto';
 import { GatewayService } from './gateway.service';
 
 /**
- * Endpoint de prueba sin JWT: facilita disparar capturas desde curl
- * mientras se valida el soporte 0x8801 de la dashcam.
+ * Endpoints de prueba sin JWT para JT808/JT1078.
  */
 @ApiTags('Gateway JT808')
 @Controller('gateway')
@@ -57,5 +57,38 @@ export class GatewayController {
   })
   mediaFetch(@Body() body: FetchMediaDto) {
     return this.gatewayService.requestMediaFetch(body.multimediaId);
+  }
+
+  @Post('video/start')
+  @HttpCode(HttpStatus.ACCEPTED)
+  @ApiOperation({
+    summary: 'Solicitar video en tiempo real JT1078 (0x9101)',
+    description:
+      'Indica a la cámara que abra un stream TCP hacia GATEWAY_MEDIA_IP:GATEWAY_MEDIA_PORT',
+  })
+  videoStart(@Body() body: StartVideoDto = {}) {
+    return this.gatewayService.requestVideoStart({
+      channelId: body.channelId ?? 1,
+      streamType: body.streamType ?? 0,
+      dataType: body.dataType ?? 1,
+      durationSeconds: body.durationSeconds ?? 30,
+    });
+  }
+
+  @Post('video/stop')
+  @HttpCode(HttpStatus.ACCEPTED)
+  @ApiOperation({
+    summary: 'Detener transmisión de video (0x9102 cierre)',
+  })
+  videoStop(@Body() body: StartVideoDto = {}) {
+    return this.gatewayService.requestVideoStop(body.channelId ?? 1);
+  }
+
+  @Get('video/status')
+  @ApiOperation({
+    summary: 'Estado del servidor media JT1078 y última solicitud 0x9101',
+  })
+  videoStatus() {
+    return this.gatewayService.getVideoStatus();
   }
 }

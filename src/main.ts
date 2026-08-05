@@ -20,7 +20,7 @@ async function bootstrap() {
     .setDescription('Documentación de la API de BASE')
     .setVersion('1.0')
     .addServer('http://localhost:3001', 'Servidor Local.')
-    .addServer('https://base.backend.mx/base-api', 'Producción.  ')
+    .addServer('https://spcode.ddns.net/api-springtrace', 'Producción.  ')
     .addBearerAuth(
       {
         type: 'http',

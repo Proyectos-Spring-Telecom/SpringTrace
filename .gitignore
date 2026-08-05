@@ -14,6 +14,8 @@ npm-debug.log*
 /historico
 # Fotos JPEG bajo demanda 0x8801/0x0801
 /fotos
+# Captura cruda JT1078
+/video
 
 pnpm-debug.log*
 yarn-debug.log*

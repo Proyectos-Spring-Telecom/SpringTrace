@@ -19,6 +19,7 @@ import {
   parseTerminalGeneralResponse,
   StoredMediaItem,
 } from './jt808.media-query';
+import { MediaServerService } from './media-server.service';
 import {
   buildCameraShootBody,
   buildMultimediaUploadAck,
@@ -27,6 +28,10 @@ import {
   parseMultimediaUpload,
   SubpackageAssembler,
 } from './jt808.multimedia';
+import {
+  buildRealtimeVideoControlBody,
+  buildRealtimeVideoRequestBody,
+} from './jt808.video';
 import {
   buildMessage,
   calcChecksum,
@@ -52,6 +57,8 @@ const MESSAGE_NAMES: Record<number, string> = {
   0x8801: 'Control inmediato de cámara',
   0x8802: 'Consulta multimedia almacenado',
   0x8805: 'Solicitar multimedia almacenado',
+  0x9101: 'Solicitud video tiempo real',
+  0x9102: 'Control transmisión video',
 };
 
 interface ConnectionState {
@@ -118,6 +125,8 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
   private readonly uploadTimeoutMs: number;
   private readonly mediaQueryTimeoutMs: number;
   private readonly defaultTerminalId: string;
+  private readonly mediaServerIp: string;
+  private readonly mediaServerPort: number;
   private readonly tokens = new Map<string, string>();
   private readonly connections = new Map<net.Socket, ConnectionState>();
   private readonly terminalSessions = new Map<string, TerminalSession>();
@@ -128,11 +137,29 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
   private readonly bodyAssemblies = new Map<string, PendingBodyAssembly>();
   private server: net.Server | null = null;
   private platformSerial = 0;
+  private lastVideoRequest: {
+    terminalId: string;
+    channelId: number;
+    dataType: number;
+    streamType: number;
+    platformSerial: number;
+    requestedAt: Date;
+    durationSeconds: number;
+    startedAt?: Date;
+    endsAt?: Date;
+    stoppedAt?: Date;
+    stopReason?: string;
+    responseResult?: number;
+    responseLabel?: string;
+    respondedAt?: Date;
+  } | null = null;
+  private videoStopTimer: NodeJS.Timeout | null = null;
 
   constructor(
     private readonly configService: ConfigService,
     private readonly captureLogger: CaptureLoggerService,
     private readonly historicoLogger: HistoricoLoggerService,
+    private readonly mediaServer: MediaServerService,
   ) {
     this.port = this.configService.get<number>('GATEWAY_PORT', 9001);
     this.debugHex =
@@ -150,6 +177,10 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
         'GATEWAY_DEFAULT_TERMINAL_ID',
         '007773050481',
       ) ?? '007773050481';
+    this.mediaServerIp =
+      this.configService.get<string>('GATEWAY_MEDIA_IP') ?? '216.238.70.193';
+    this.mediaServerPort =
+      this.configService.get<number>('GATEWAY_MEDIA_PORT', 9002) ?? 9002;
 
     const configuredFotos =
       this.configService.get<string>('GATEWAY_FOTOS_DIR') ?? './fotos';
@@ -189,6 +220,8 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
   }
 
   async onModuleDestroy(): Promise<void> {
+    this.clearVideoStopTimer();
+
     for (const pending of this.pendingCameraCommands.values()) {
       clearTimeout(pending.timeout);
     }
@@ -392,6 +425,264 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
       multimediaId,
       multimediaIdHex: `0x${multimediaId.toString(16).padStart(8, '0')}`,
     };
+  }
+
+  /**
+   * Solicita video en tiempo real (0x9101) y arma espera de conexión al puerto media.
+   */
+  async requestVideoStart(options?: {
+    channelId?: number;
+    streamType?: 0 | 1;
+    dataType?: 0 | 1;
+    durationSeconds?: number;
+  }): Promise<{
+    message: string;
+    status: 'sent';
+    terminalId: string;
+    channelId: number;
+    dataType: number;
+    streamType: number;
+    serverIp: string;
+    tcpPort: number;
+    udpPort: number;
+    platformSerial: number;
+    durationSeconds: number;
+  }> {
+    const currentMedia = this.mediaServer.getStatus();
+    if (
+      (this.lastVideoRequest && !this.lastVideoRequest.stoppedAt) ||
+      currentMedia.activeConnection ||
+      currentMedia.waitingForConnection
+    ) {
+      await this.stopVideoSession(
+        'reemplazada por nueva solicitud',
+        true,
+        this.lastVideoRequest?.channelId ?? 1,
+      );
+    }
+
+    const session = this.selectTargetSession();
+    if (!session.authenticated || !session.socket || session.socket.destroyed) {
+      throw new ConflictException(
+        `Terminal ${session.terminalId} no está autenticado; no se puede iniciar video`,
+      );
+    }
+
+    const channelId = options?.channelId ?? 1;
+    const streamType = options?.streamType ?? 0;
+    const dataType = options?.dataType ?? 1;
+    const durationSeconds = options?.durationSeconds ?? 30;
+    const body = buildRealtimeVideoRequestBody({
+      serverIp: this.mediaServerIp,
+      tcpPort: this.mediaServerPort,
+      udpPort: 0,
+      channelId,
+      dataType,
+      streamType,
+    });
+
+    const platformSerial = this.send(
+      session.socket,
+      0x9101,
+      session.terminalId,
+      body,
+      `iniciar video CH${channelId} dataType=${dataType} streamType=${streamType} → ${this.mediaServerIp}:${this.mediaServerPort}`,
+    );
+
+    this.lastVideoRequest = {
+      terminalId: session.terminalId,
+      channelId,
+      dataType,
+      streamType,
+      platformSerial,
+      requestedAt: new Date(),
+      durationSeconds,
+    };
+    this.mediaServer.expectConnection(
+      session.terminalId,
+      () => this.handleVideoMediaConnected(platformSerial),
+      () => {
+        void this.stopVideoSession('sin conexión media', true, channelId);
+      },
+    );
+
+    this.logger.log(
+      `0x9101 enviado: terminal=${session.terminalId}, serial=${platformSerial}, ` +
+        `media=${this.mediaServerIp}:${this.mediaServerPort}, canal=${channelId}`,
+    );
+
+    return {
+      message: 'solicitud de video enviada; esperando conexión al puerto media',
+      status: 'sent',
+      terminalId: session.terminalId,
+      channelId,
+      dataType,
+      streamType,
+      serverIp: this.mediaServerIp,
+      tcpPort: this.mediaServerPort,
+      udpPort: 0,
+      platformSerial,
+      durationSeconds,
+    };
+  }
+
+  /** Detiene el stream: 0x9102 cierre + cierra captura media local. */
+  async requestVideoStop(channelId = 1): Promise<{
+    message: string;
+    terminalId: string;
+    channelId: number;
+    platformSerial: number | null;
+    media: ReturnType<MediaServerService['getStatus']>;
+  }> {
+    const result = await this.stopVideoSession(
+      'detención manual',
+      true,
+      channelId,
+    );
+    return {
+      message: 'stop de video solicitado',
+      terminalId: result.terminalId,
+      channelId,
+      platformSerial: result.platformSerial,
+      media: result.media,
+    };
+  }
+
+  getVideoStatus() {
+    const media = this.mediaServer.getStatus();
+    const now = Date.now();
+    const remainingSeconds =
+      this.lastVideoRequest?.endsAt && !this.lastVideoRequest.stoppedAt
+        ? Math.max(
+            0,
+            Math.ceil((this.lastVideoRequest.endsAt.getTime() - now) / 1000),
+          )
+        : null;
+
+    return {
+      active:
+        !!this.lastVideoRequest &&
+        !this.lastVideoRequest.stoppedAt &&
+        (media.activeConnection || media.waitingForConnection),
+      remainingSeconds,
+      lastRequest: this.lastVideoRequest
+        ? {
+            ...this.lastVideoRequest,
+            requestedAt: this.lastVideoRequest.requestedAt.toISOString(),
+            startedAt: this.lastVideoRequest.startedAt?.toISOString() ?? null,
+            endsAt: this.lastVideoRequest.endsAt?.toISOString() ?? null,
+            stoppedAt: this.lastVideoRequest.stoppedAt?.toISOString() ?? null,
+            respondedAt:
+              this.lastVideoRequest.respondedAt?.toISOString() ?? null,
+          }
+        : null,
+      mediaServerIp: this.mediaServerIp,
+      media,
+    };
+  }
+
+  private handleVideoMediaConnected(platformSerial: number): void {
+    const request = this.lastVideoRequest;
+    if (
+      !request ||
+      request.platformSerial !== platformSerial ||
+      request.stoppedAt
+    ) {
+      return;
+    }
+
+    const startedAt = new Date();
+    request.startedAt = startedAt;
+    request.endsAt = new Date(
+      startedAt.getTime() + request.durationSeconds * 1000,
+    );
+    this.clearVideoStopTimer();
+    this.videoStopTimer = setTimeout(() => {
+      void this.stopVideoSession(
+        'auto-corte por duración',
+        true,
+        request.channelId,
+      );
+    }, request.durationSeconds * 1000);
+
+    this.logger.log(
+      `Video JT1078 conectado; auto-corte en ${request.durationSeconds}s: ` +
+        `terminal=${request.terminalId}, canal=${request.channelId}`,
+    );
+  }
+
+  private async stopVideoSession(
+    reason: string,
+    sendControl: boolean,
+    fallbackChannel: number,
+  ): Promise<{
+    terminalId: string;
+    platformSerial: number | null;
+    media: ReturnType<MediaServerService['getStatus']>;
+  }> {
+    this.clearVideoStopTimer();
+    const request = this.lastVideoRequest;
+    const session = this.selectTargetSession();
+    const channelId = request?.channelId ?? fallbackChannel;
+    let platformSerial: number | null = null;
+
+    if (
+      sendControl &&
+      session.authenticated &&
+      session.socket &&
+      !session.socket.destroyed
+    ) {
+      const body = buildRealtimeVideoControlBody({
+        channelId,
+        controlCmd: 0,
+        closeType: 0,
+      });
+      platformSerial = this.send(
+        session.socket,
+        0x9102,
+        session.terminalId,
+        body,
+        `cerrar transmisión video CH${channelId}`,
+      );
+      this.logger.log(
+        `0x9102 enviado: terminal=${session.terminalId}, canal=${channelId}, serial=${platformSerial}`,
+      );
+    } else if (sendControl) {
+      this.logger.warn(
+        `Stop video sin sesión autenticada: terminal=${session.terminalId}; ` +
+          'solo se cierra el lado media local',
+      );
+    }
+
+    const mediaBeforeStop = this.mediaServer.getStatus();
+    await this.mediaServer.stopCapture(reason);
+    const stoppedAt = new Date();
+    if (request) {
+      request.stoppedAt = stoppedAt;
+      request.stopReason = reason;
+    }
+    const durationRealSeconds = request?.startedAt
+      ? (stoppedAt.getTime() - request.startedAt.getTime()) / 1000
+      : 0;
+
+    this.logger.log(
+      `VIDEO resumen final: motivo=${reason}, duración=${durationRealSeconds.toFixed(1)}s, ` +
+        `packets=${mediaBeforeStop.packets}, bytes=${mediaBeforeStop.bytes}, ` +
+        `jt1078=${mediaBeforeStop.jt1078MarkerSeen}, file=${mediaBeforeStop.rawFilePath}`,
+    );
+
+    return {
+      terminalId: request?.terminalId ?? session.terminalId,
+      platformSerial,
+      media: this.mediaServer.getStatus(),
+    };
+  }
+
+  private clearVideoStopTimer(): void {
+    if (this.videoStopTimer) {
+      clearTimeout(this.videoStopTimer);
+      this.videoStopTimer = null;
+    }
   }
 
   getStatus(): Array<{
@@ -624,6 +915,10 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
       case 0x0001:
         this.handleTerminalGeneralResponse(completeMessage);
         break;
+      case 0x8001:
+        // Algunos firmwares etiquetan su ACK genérico como 0x8001.
+        this.handleTerminalGeneralResponse(completeMessage);
+        break;
       case 0x0100:
         this.handleRegistration(socket, state, completeMessage);
         break;
@@ -663,7 +958,7 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
     try {
       const response = parseTerminalGeneralResponse(message.body);
       const log =
-        `0x0001 terminal=${message.terminalId}, ` +
+        `${this.formatMessage(message.messageId)} terminal=${message.terminalId}, ` +
         `serialRespondido=${response.responseSerial}, ` +
         `mensajeRespondido=${this.formatMessage(response.responseMessageId)}, ` +
         `resultado=${response.result} (${response.resultLabel})`;
@@ -672,6 +967,27 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
         this.logger.log(log);
       } else {
         this.logger.warn(log);
+      }
+
+      if (
+        response.responseMessageId === 0x9101 &&
+        this.lastVideoRequest?.terminalId === message.terminalId &&
+        this.lastVideoRequest.platformSerial === response.responseSerial
+      ) {
+        this.lastVideoRequest.responseResult = response.result;
+        this.lastVideoRequest.responseLabel = response.resultLabel;
+        this.lastVideoRequest.respondedAt = new Date();
+        if (response.result !== 0) {
+          this.logger.warn(
+            `La cámara rechazó 0x9101: result=${response.result} ` +
+              `(${response.resultLabel})`,
+          );
+          void this.stopVideoSession(
+            `0x9101 rechazado: ${response.resultLabel}`,
+            false,
+            this.lastVideoRequest.channelId,
+          );
+        }
       }
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
