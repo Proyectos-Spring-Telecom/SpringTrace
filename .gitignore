@@ -8,7 +8,7 @@ logs
 *.log
 npm-debug.log*
 
-# Capturas TCP sniffer (JT808 exploratorio)
+# Capturas TCP gateway JT808
 /capturas
 
 pnpm-debug.log*

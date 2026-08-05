@@ -33,6 +33,8 @@ import Joi from 'joi';
         UPLOAD_MAX_SIZE: Joi.string().optional().allow(''),
         GATEWAY_PORT: Joi.number().optional().default(9001),
         GATEWAY_DEBUG_HEX: Joi.boolean().optional().default(false),
+        GATEWAY_CAPTURE_ENABLED: Joi.boolean().optional().default(true),
+        GATEWAY_CAPTURE_DIR: Joi.string().optional().default('./capturas'),
       }),
     }),
 

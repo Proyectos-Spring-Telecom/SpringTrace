@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as net from 'net';
+import { CaptureLoggerService } from './capture-logger.service';
 import {
   buildMessage,
   calcChecksum,
@@ -41,7 +42,10 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
   private server: net.Server | null = null;
   private platformSerial = 0;
 
-  constructor(private readonly configService: ConfigService) {
+  constructor(
+    private readonly configService: ConfigService,
+    private readonly captureLogger: CaptureLoggerService,
+  ) {
     this.port = this.configService.get<number>('GATEWAY_PORT', 9001);
     this.debugHex =
       this.configService.get<boolean>('GATEWAY_DEBUG_HEX', false) ?? false;
@@ -136,10 +140,14 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
     state: ConnectionState,
     escapedFrame: Buffer,
   ): void {
+    const fullFrame = Buffer.concat([
+      Buffer.from([0x7e]),
+      escapedFrame,
+      Buffer.from([0x7e]),
+    ]);
+
     if (this.debugHex) {
-      this.logger.debug(
-        `RX ${Buffer.concat([Buffer.from([0x7e]), escapedFrame, Buffer.from([0x7e])]).toString('hex')}`,
-      );
+      this.logger.debug(`RX ${fullFrame.toString('hex')}`);
     }
 
     try {
@@ -167,6 +175,14 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
       }
 
       this.logReceived(message);
+      this.captureLogger.logFrame({
+        direction: 'RX',
+        remote: this.remoteAddress(socket),
+        terminalId: message.terminalId,
+        messageId: message.messageId,
+        messageLabel: MESSAGE_NAMES[message.messageId] ?? 'Desconocido',
+        frame: fullFrame,
+      });
 
       switch (message.messageId) {
         case 0x0100:
@@ -191,6 +207,14 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
       if (!this.debugHex) {
         this.logger.warn(`RX inválido ${escapedFrame.toString('hex')}`);
       }
+      this.captureLogger.logFrame({
+        direction: 'RX',
+        remote: this.remoteAddress(socket),
+        terminalId: state.terminalId,
+        messageId: 0xffff,
+        messageLabel: `Descartada: ${detail}`,
+        frame: fullFrame,
+      });
     }
   }
 
@@ -209,13 +233,7 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
     body[2] = 0x00;
     body.write(token, 3, 'ascii');
 
-    this.send(
-      socket,
-      0x8100,
-      message.terminalId,
-      body,
-      'registro aceptado',
-    );
+    this.send(socket, 0x8100, message.terminalId, body, 'registro aceptado');
   }
 
   private handleAuthentication(
@@ -278,6 +296,15 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
         `TX terminal=${terminalId}, messageId=${this.formatMessage(messageId)}, ` +
           `serial=${serialNumber}, resultado=${detail}`,
       );
+    });
+
+    this.captureLogger.logFrame({
+      direction: 'TX',
+      remote: this.remoteAddress(socket),
+      terminalId,
+      messageId,
+      messageLabel: MESSAGE_NAMES[messageId] ?? 'Desconocido',
+      frame,
     });
 
     if (this.debugHex) {
