@@ -15,6 +15,7 @@ import { parseLocation } from './jt808.location';
 import {
   buildCameraShootBody,
   buildMultimediaUploadAck,
+  buildStoredMultimediaUploadCommand,
   parseCameraControlResponse,
   parseMultimediaUpload,
   SubpackageAssembler,
@@ -40,6 +41,7 @@ const MESSAGE_NAMES: Record<number, string> = {
   0x8100: 'Respuesta de registro',
   0x8800: 'ACK subida multimedia',
   0x8801: 'Control inmediato de cámara',
+  0x8805: 'Solicitar multimedia almacenado',
 };
 
 interface ConnectionState {
@@ -51,6 +53,14 @@ interface ConnectionState {
 interface PendingCameraCommand {
   terminalId: string;
   channelId: number;
+  saveFlag: 0 | 1;
+  timeout: NodeJS.Timeout;
+}
+
+interface PendingMultimediaUpload {
+  terminalId: string;
+  multimediaId: number;
+  strategy: 'stored-0x8805' | 'immediate';
   timeout: NodeJS.Timeout;
 }
 
@@ -69,11 +79,16 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
   private readonly debugHex: boolean;
   private readonly fotosDir: string;
   private readonly captureTimeoutMs: number;
+  private readonly uploadTimeoutMs: number;
   private readonly tokens = new Map<string, string>();
   private readonly connections = new Map<net.Socket, ConnectionState>();
   private readonly pendingCameraCommands = new Map<
     number,
     PendingCameraCommand
+  >();
+  private readonly pendingMultimediaUploads = new Map<
+    string,
+    PendingMultimediaUpload
   >();
   private readonly bodyAssemblies = new Map<string, PendingBodyAssembly>();
   private server: net.Server | null = null;
@@ -90,6 +105,8 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
     this.captureTimeoutMs =
       this.configService.get<number>('GATEWAY_CAPTURE_TIMEOUT_MS', 30000) ??
       30000;
+    this.uploadTimeoutMs =
+      this.configService.get<number>('GATEWAY_UPLOAD_TIMEOUT', 30000) ?? 30000;
 
     const configuredFotos =
       this.configService.get<string>('GATEWAY_FOTOS_DIR') ?? './fotos';
@@ -131,6 +148,10 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
       clearTimeout(pending.timeout);
     }
     this.pendingCameraCommands.clear();
+    for (const pending of this.pendingMultimediaUploads.values()) {
+      clearTimeout(pending.timeout);
+    }
+    this.pendingMultimediaUploads.clear();
     this.bodyAssemblies.clear();
 
     for (const socket of this.connections.keys()) {
@@ -160,10 +181,15 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
    * Dispara 0x8801 a la primera cámara autenticada conectada.
    * Endpoint de prueba: sin JWT.
    */
-  requestPhotoCapture(channelId = 1): {
+  requestPhotoCapture(
+    channelId = 2,
+    saveFlag: 0 | 1 = 1,
+  ): {
     message: string;
     terminalId: string;
     channelId: number;
+    saveFlag: 0 | 1;
+    strategy: 'stored-0x8805' | 'immediate';
     platformSerial: number;
   } {
     const connected = this.findAuthenticatedConnection();
@@ -173,26 +199,35 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
       );
     }
 
-    const body = buildCameraShootBody({ channelId });
+    const strategy = saveFlag === 1 ? 'stored-0x8805' : 'immediate';
+    const body = buildCameraShootBody({ channelId, saveFlag });
     const platformSerial = this.send(
       connected.socket,
       0x8801,
       connected.terminalId,
       body,
-      `captura solicitada canal=${channelId}`,
+      `captura solicitada canal=${channelId}, estrategia=${strategy}`,
     );
 
-    this.armCaptureTimeout(platformSerial, connected.terminalId, channelId);
+    this.armCaptureTimeout(
+      platformSerial,
+      connected.terminalId,
+      channelId,
+      saveFlag,
+    );
 
     this.logger.log(
       `Captura solicitada: terminal=${connected.terminalId}, ` +
-        `canal=${channelId}, serialPlataforma=${platformSerial}`,
+        `canal=${channelId}, saveFlag=${saveFlag}, estrategia=${strategy}, ` +
+        `serialPlataforma=${platformSerial}`,
     );
 
     return {
       message: 'captura solicitada',
       terminalId: connected.terminalId,
       channelId,
+      saveFlag,
+      strategy,
       platformSerial,
     };
   }
@@ -285,7 +320,17 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
         messageId: message.messageId,
         messageLabel: MESSAGE_NAMES[message.messageId] ?? 'Desconocido',
         frame: fullFrame,
+        includeHexDump: message.messageId !== 0x0801,
       });
+
+      if (
+        message.messageId === 0x0801 &&
+        (!message.hasSubpackages || message.packageNo === 1) &&
+        message.body.length >= 4
+      ) {
+        const multimediaId = message.body.readUInt32BE(0);
+        this.markMultimediaUploadStarted(message.terminalId, multimediaId);
+      }
 
       if (message.hasSubpackages) {
         this.handleSubpackageFrame(socket, message);
@@ -387,7 +432,7 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
         this.handleCameraControlResponse(socket, completeMessage);
         break;
       case 0x0801:
-        this.handleMultimediaUpload(socket, completeMessage);
+        void this.handleMultimediaUpload(socket, completeMessage);
         break;
       default:
         this.logger.warn(
@@ -482,14 +527,50 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
   ): void {
     try {
       const response = parseCameraControlResponse(message.body);
-      this.clearCaptureTimeout(response.responseSerial);
+      const command = this.consumeCaptureCommand(response.responseSerial);
 
       if (response.result === 0) {
+        const strategy =
+          command?.saveFlag === 0 ? 'immediate' : 'stored-0x8805';
         this.logger.log(
           `0x0805 éxito: terminal=${message.terminalId}, ` +
             `serialRespondido=${response.responseSerial}, ` +
-            `multimediaIds=[${response.multimediaIds.join(', ')}]`,
+            `multimediaIds=[${response.multimediaIds.join(', ')}], ` +
+            `estrategia=${strategy}`,
         );
+
+        if (response.multimediaIds.length === 0) {
+          this.logger.warn(
+            `0x0805 exitoso sin multimediaId: terminal=${message.terminalId}`,
+          );
+        }
+
+        for (const multimediaId of response.multimediaIds) {
+          this.armUploadTimeout(message.terminalId, multimediaId, strategy);
+
+          if (strategy === 'stored-0x8805') {
+            const uploadBody = buildStoredMultimediaUploadCommand(
+              multimediaId,
+              0,
+            );
+            this.send(
+              socket,
+              0x8805,
+              message.terminalId,
+              uploadBody,
+              `solicitar multimedia almacenado id=${multimediaId}, deleteFlag=0`,
+            );
+            this.logger.log(
+              `0x8805 enviado: terminal=${message.terminalId}, ` +
+                `multimediaId=${multimediaId}, deleteFlag=0`,
+            );
+          } else {
+            this.logger.log(
+              `Esperando subida inmediata 0x0801: terminal=${message.terminalId}, ` +
+                `multimediaId=${multimediaId}`,
+            );
+          }
+        }
       } else {
         this.logger.warn(
           `Cámara RECHAZÓ la captura: terminal=${message.terminalId}, ` +
@@ -497,48 +578,44 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
             `serialRespondido=${response.responseSerial}`,
         );
       }
-
-      // Algunos terminales esperan ACK genérico además del flujo multimedia.
-      this.sendGeneralResponse(
-        socket,
-        message,
-        0x00,
-        `0x0805 ${response.resultLabel}`,
-      );
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
       this.logger.warn(`Error al parsear 0x0805: ${detail}`);
-      this.sendGeneralResponse(
-        socket,
-        message,
-        0x00,
-        '0x0805 ACK (parse falló)',
-      );
     }
   }
 
-  private handleMultimediaUpload(
+  private async handleMultimediaUpload(
     socket: net.Socket,
     message: Jt808Header,
-  ): void {
+  ): Promise<void> {
     try {
       const upload = parseMultimediaUpload(message.body);
-      const filePath = this.savePhotoFile(
-        message.terminalId,
-        upload.multimediaId,
-        upload.mediaData,
-      );
+      this.markMultimediaUploadStarted(message.terminalId, upload.multimediaId);
 
       const looksJpeg =
         upload.mediaData.length >= 2 &&
         upload.mediaData[0] === 0xff &&
         upload.mediaData[1] === 0xd8;
+      if (!looksJpeg) {
+        this.logger.warn(
+          `Multimedia no inicia con FF D8: terminal=${message.terminalId}, ` +
+            `multimediaId=${upload.multimediaId}, ` +
+            `primerosBytes=${upload.mediaData.subarray(0, 8).toString('hex')}`,
+        );
+      }
+
+      const filePath = await this.savePhotoFile(
+        message.terminalId,
+        upload.multimediaId,
+        upload.mediaData,
+      );
 
       this.logger.log(
         `Foto guardada: terminal=${message.terminalId}, ` +
           `multimediaId=${upload.multimediaId}, ` +
           `tipo=${upload.multimediaType}, formato=${upload.multimediaFormat}, ` +
-          `canal=${upload.channelId}, bytes=${upload.mediaData.length}, ` +
+          `canal=${upload.channelId}, dataOffset=${upload.mediaDataOffset}, ` +
+          `bytes=${upload.mediaData.length}, ` +
           `jpegMagic=${looksJpeg}, path=${filePath}`,
       );
 
@@ -559,16 +636,16 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
     }
   }
 
-  private savePhotoFile(
+  private async savePhotoFile(
     terminalId: string,
     multimediaId: number,
     mediaData: Buffer,
-  ): string {
+  ): Promise<string> {
     fs.mkdirSync(this.fotosDir, { recursive: true });
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const fileName = `foto-${terminalId}-${multimediaId}-${stamp}.jpg`;
     const filePath = path.join(this.fotosDir, fileName);
-    fs.writeFileSync(filePath, mediaData);
+    await fs.promises.writeFile(filePath, mediaData);
     return filePath;
   }
 
@@ -576,6 +653,7 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
     platformSerial: number,
     terminalId: string,
     channelId: number,
+    saveFlag: 0 | 1,
   ): void {
     this.clearCaptureTimeout(platformSerial);
 
@@ -583,7 +661,8 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
       this.pendingCameraCommands.delete(platformSerial);
       this.logger.warn(
         `Sin respuesta de captura (0x0805) tras ${this.captureTimeoutMs}ms: ` +
-          `terminal=${terminalId}, canal=${channelId}, serialPlataforma=${platformSerial}. ` +
+          `terminal=${terminalId}, canal=${channelId}, saveFlag=${saveFlag}, ` +
+          `serialPlataforma=${platformSerial}. ` +
           'Posible no soporte del comando 0x8801.',
       );
     }, this.captureTimeoutMs);
@@ -591,17 +670,81 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
     this.pendingCameraCommands.set(platformSerial, {
       terminalId,
       channelId,
+      saveFlag,
       timeout,
     });
   }
 
-  private clearCaptureTimeout(platformSerial: number): void {
+  private consumeCaptureCommand(
+    platformSerial: number,
+  ): PendingCameraCommand | undefined {
     const pending = this.pendingCameraCommands.get(platformSerial);
     if (!pending) {
-      return;
+      return undefined;
     }
     clearTimeout(pending.timeout);
     this.pendingCameraCommands.delete(platformSerial);
+    return pending;
+  }
+
+  private clearCaptureTimeout(platformSerial: number): void {
+    this.consumeCaptureCommand(platformSerial);
+  }
+
+  private armUploadTimeout(
+    terminalId: string,
+    multimediaId: number,
+    strategy: 'stored-0x8805' | 'immediate',
+  ): void {
+    const key = this.multimediaKey(terminalId, multimediaId);
+    this.clearUploadTimeout(terminalId, multimediaId);
+
+    const timeout = setTimeout(() => {
+      this.pendingMultimediaUploads.delete(key);
+      this.logger.warn(
+        `Sin subida de multimedia tras ${this.uploadTimeoutMs}ms: ` +
+          `terminal=${terminalId}, multimediaId=${multimediaId}, ` +
+          `estrategia=${strategy}`,
+      );
+    }, this.uploadTimeoutMs);
+
+    this.pendingMultimediaUploads.set(key, {
+      terminalId,
+      multimediaId,
+      strategy,
+      timeout,
+    });
+  }
+
+  private markMultimediaUploadStarted(
+    terminalId: string,
+    multimediaId: number,
+  ): void {
+    const pending = this.clearUploadTimeout(terminalId, multimediaId);
+    if (pending) {
+      this.logger.log(
+        `Subida 0x0801 iniciada: terminal=${terminalId}, ` +
+          `multimediaId=${multimediaId}, estrategia=${pending.strategy}`,
+      );
+    }
+  }
+
+  private clearUploadTimeout(
+    terminalId: string,
+    multimediaId: number,
+  ): PendingMultimediaUpload | undefined {
+    const key = this.multimediaKey(terminalId, multimediaId);
+    const pending = this.pendingMultimediaUploads.get(key);
+    if (!pending) {
+      return undefined;
+    }
+    clearTimeout(pending.timeout);
+    this.pendingMultimediaUploads.delete(key);
+    return pending;
+  }
+
+  private multimediaKey(terminalId: string, multimediaId: number): string {
+    return `${terminalId}:${multimediaId}`;
   }
 
   private clearStateForTerminal(terminalId: string): void {
@@ -609,6 +752,12 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
       if (pending.terminalId === terminalId) {
         clearTimeout(pending.timeout);
         this.pendingCameraCommands.delete(serial);
+      }
+    }
+    for (const [key, pending] of this.pendingMultimediaUploads) {
+      if (pending.terminalId === terminalId) {
+        clearTimeout(pending.timeout);
+        this.pendingMultimediaUploads.delete(key);
       }
     }
     for (const [key, assembly] of this.bodyAssemblies) {

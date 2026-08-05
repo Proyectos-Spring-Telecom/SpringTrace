@@ -31,7 +31,8 @@ export interface MultimediaUpload {
   multimediaFormat: number;
   eventCode: number;
   channelId: number;
-  /** Bytes del archivo (JPEG u otro), tras cabecera + ubicación. */
+  mediaDataOffset: number;
+  /** Bytes del archivo (JPEG u otro), tras cabecera y ubicación opcional. */
   mediaData: Buffer;
 }
 
@@ -105,11 +106,13 @@ export function parseCameraControlResponse(
  * Cabecera fija (8) + ubicación (28) + datos multimedia.
  */
 export function parseMultimediaUpload(body: Buffer): MultimediaUpload {
-  if (body.length < MULTIMEDIA_DATA_OFFSET) {
+  if (body.length < MULTIMEDIA_FIXED_HEADER) {
     throw new Error(
-      `Cuerpo 0x0801 demasiado corto: ${body.length} bytes (mínimo ${MULTIMEDIA_DATA_OFFSET})`,
+      `Cuerpo 0x0801 demasiado corto: ${body.length} bytes (mínimo ${MULTIMEDIA_FIXED_HEADER})`,
     );
   }
+
+  const mediaDataOffset = findMediaDataOffset(body);
 
   return {
     multimediaId: body.readUInt32BE(0),
@@ -117,12 +120,29 @@ export function parseMultimediaUpload(body: Buffer): MultimediaUpload {
     multimediaFormat: body[5],
     eventCode: body[6],
     channelId: body[7],
-    mediaData: Buffer.from(body.subarray(MULTIMEDIA_DATA_OFFSET)),
+    mediaDataOffset,
+    mediaData: Buffer.from(body.subarray(mediaDataOffset)),
   };
 }
 
+/** Comando 0x8805: solicitar subida de un multimedia almacenado. */
+export function buildStoredMultimediaUploadCommand(
+  multimediaId: number,
+  deleteFlag = 0,
+): Buffer {
+  if (deleteFlag !== 0 && deleteFlag !== 1) {
+    throw new RangeError('deleteFlag debe ser 0 (conservar) o 1 (borrar)');
+  }
+
+  const body = Buffer.alloc(5);
+  body.writeUInt32BE(multimediaId >>> 0, 0);
+  body[4] = deleteFlag;
+  return body;
+}
+
 /**
- * Respuesta 0x8800 de éxito: multimediaId + cantidad de retransmisión = 0.
+ * Respuesta 0x8800 de éxito JT/T 808-2011:
+ * multimediaId (DWORD) + totalRetransmit (BYTE) = 0.
  * Indica que no faltan paquetes.
  */
 export function buildMultimediaUploadAck(multimediaId: number): Buffer {
@@ -130,6 +150,39 @@ export function buildMultimediaUploadAck(multimediaId: number): Buffer {
   body.writeUInt32BE(multimediaId >>> 0, 0);
   body[4] = 0;
   return body;
+}
+
+/**
+ * Hikvision puede incluir o no los 28 bytes de posición. Preferimos los
+ * offsets estándar y, como fallback tolerante, buscamos el SOI JPEG.
+ */
+function findMediaDataOffset(body: Buffer): number {
+  if (hasJpegMagic(body, MULTIMEDIA_DATA_OFFSET)) {
+    return MULTIMEDIA_DATA_OFFSET;
+  }
+  if (hasJpegMagic(body, MULTIMEDIA_FIXED_HEADER)) {
+    return MULTIMEDIA_FIXED_HEADER;
+  }
+
+  const searchEnd = Math.min(body.length - 1, 72);
+  for (let offset = MULTIMEDIA_FIXED_HEADER; offset < searchEnd; offset++) {
+    if (hasJpegMagic(body, offset)) {
+      return offset;
+    }
+  }
+
+  // Para formatos no JPEG conservamos el layout estándar JT808.
+  return body.length >= MULTIMEDIA_DATA_OFFSET
+    ? MULTIMEDIA_DATA_OFFSET
+    : MULTIMEDIA_FIXED_HEADER;
+}
+
+function hasJpegMagic(buffer: Buffer, offset: number): boolean {
+  return (
+    offset + 1 < buffer.length &&
+    buffer[offset] === 0xff &&
+    buffer[offset + 1] === 0xd8
+  );
 }
 
 /** Ensambla fragmentos de cuerpo JT808 por número de paquete (1-based). */

@@ -1,6 +1,7 @@
 import {
   buildCameraShootBody,
   buildMultimediaUploadAck,
+  buildStoredMultimediaUploadCommand,
   parseCameraControlResponse,
   parseMultimediaUpload,
   SubpackageAssembler,
@@ -58,10 +59,31 @@ describe('JT808 multimedia', () => {
 
     const upload = parseMultimediaUpload(assembler.assemble());
     expect(upload.multimediaId).toBe(99);
+    expect(upload.mediaDataOffset).toBe(36);
     expect(upload.mediaData).toEqual(jpeg);
 
     const ack = buildMultimediaUploadAck(99);
+    expect(ack).toHaveLength(5);
     expect(ack.readUInt32BE(0)).toBe(99);
     expect(ack[4]).toBe(0);
+  });
+
+  it('construye 0x8805 para conservar el multimedia almacenado', () => {
+    const body = buildStoredMultimediaUploadCommand(0x000003ea, 0);
+    expect(body).toEqual(Buffer.from([0x00, 0x00, 0x03, 0xea, 0x00]));
+  });
+
+  it('tolera 0x0801 sin los 28 bytes opcionales de posición', () => {
+    const jpeg = Buffer.from([0xff, 0xd8, 0xff, 0xd9]);
+    const body = Buffer.alloc(8 + jpeg.length);
+    body.writeUInt32BE(0x3ea, 0);
+    body[4] = 0;
+    body[5] = 0;
+    body[7] = 1;
+    jpeg.copy(body, 8);
+
+    const upload = parseMultimediaUpload(body);
+    expect(upload.mediaDataOffset).toBe(8);
+    expect(upload.mediaData).toEqual(jpeg);
   });
 });

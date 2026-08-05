@@ -20,6 +20,9 @@ export class GatewayController {
       'Envía el comando JT808 0x8801. Sin autenticación JWT (solo pruebas).',
   })
   capture(@Body() body: CapturePhotoDto) {
-    return this.gatewayService.requestPhotoCapture(body.channelId ?? 1);
+    return this.gatewayService.requestPhotoCapture(
+      body.channelId ?? 2,
+      body.saveFlag ?? 1,
+    );
   }
 }

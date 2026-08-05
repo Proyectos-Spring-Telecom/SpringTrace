@@ -17,6 +17,8 @@ export interface CaptureFrameMeta {
   messageId: number;
   messageLabel: string;
   frame: Buffer;
+  /** false para cargas grandes (p. ej. 0x0801): conserva cabecera y tamaño. */
+  includeHexDump?: boolean;
 }
 
 @Injectable()
@@ -93,15 +95,19 @@ export class CaptureLoggerService implements OnModuleInit, OnModuleDestroy {
     const stamp = new Date().toISOString();
     const terminal = meta.terminalId ?? 'desconocido';
     const messageIdHex = `0x${meta.messageId.toString(16).padStart(4, '0')}`;
-    const dump = this.toHexDump(meta.frame);
-
-    return [
+    const lines = [
       `--- ${stamp} | ${meta.direction} | ${meta.remote} | terminal=${terminal} | ` +
         `messageId=${messageIdHex} (${meta.messageLabel}) | ${meta.frame.length} byte(s) ---`,
-      dump,
-      '',
-      '',
-    ].join('\n');
+    ];
+
+    if (meta.includeHexDump === false) {
+      lines.push('[hex omitido: carga multimedia]');
+    } else {
+      lines.push(this.toHexDump(meta.frame));
+    }
+
+    lines.push('', '');
+    return lines.join('\n');
   }
 
   /** Hex dump: offset + 16 bytes hex + ASCII imprimible. */
