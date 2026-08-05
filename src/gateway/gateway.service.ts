@@ -7,6 +7,8 @@ import {
 import { ConfigService } from '@nestjs/config';
 import * as net from 'net';
 import { CaptureLoggerService } from './capture-logger.service';
+import { HistoricoLoggerService } from './historico-logger.service';
+import { parseLocation } from './jt808.location';
 import {
   buildMessage,
   calcChecksum,
@@ -45,6 +47,7 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
   constructor(
     private readonly configService: ConfigService,
     private readonly captureLogger: CaptureLoggerService,
+    private readonly historicoLogger: HistoricoLoggerService,
   ) {
     this.port = this.configService.get<number>('GATEWAY_PORT', 9001);
     this.debugHex =
@@ -194,6 +197,9 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
         case 0x0002:
           this.sendGeneralResponse(socket, message, 0x00, 'heartbeat');
           break;
+        case 0x0200:
+          this.handleLocation(socket, message);
+          break;
         default:
           this.logger.warn(
             `Mensaje no manejado aún: terminal=${message.terminalId}, ` +
@@ -257,6 +263,39 @@ export class GatewayService implements OnModuleInit, OnModuleDestroy {
       accepted ? 0x00 : 0x01,
       accepted ? 'autenticación aceptada' : 'token de autenticación inválido',
     );
+  }
+
+  private handleLocation(socket: net.Socket, message: Jt808Header): void {
+    try {
+      const location = parseLocation(message.body);
+
+      this.logger.log(
+        `POS terminal=${message.terminalId} ` +
+          `lat=${location.latitude.toFixed(6)} lng=${location.longitude.toFixed(6)} ` +
+          `speed=${location.speedKmh.toFixed(1)}km/h dir=${location.direction}° ` +
+          `timeMX=${location.timeLocalMx} validPos=${location.positionValid}`,
+      );
+
+      this.historicoLogger.logLocation({
+        remote: this.remoteAddress(socket),
+        terminalId: message.terminalId,
+        location,
+      });
+
+      this.sendGeneralResponse(socket, message, 0x00, 'posición aceptada');
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      this.logger.warn(
+        `No se pudo parsear 0x0200 de terminal=${message.terminalId}: ${detail}`,
+      );
+      // ACK igual para no provocar reintentos en bucle de la cámara.
+      this.sendGeneralResponse(
+        socket,
+        message,
+        0x00,
+        'posición ACK (parse falló)',
+      );
+    }
   }
 
   private sendGeneralResponse(

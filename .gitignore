@@ -10,6 +10,8 @@ npm-debug.log*
 
 # Capturas TCP gateway JT808
 /capturas
+# Posiciones decodificadas 0x0200
+/historico
 
 pnpm-debug.log*
 yarn-debug.log*

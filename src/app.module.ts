@@ -35,6 +35,8 @@ import Joi from 'joi';
         GATEWAY_DEBUG_HEX: Joi.boolean().optional().default(false),
         GATEWAY_CAPTURE_ENABLED: Joi.boolean().optional().default(true),
         GATEWAY_CAPTURE_DIR: Joi.string().optional().default('./capturas'),
+        GATEWAY_HISTORICO_ENABLED: Joi.boolean().optional().default(true),
+        GATEWAY_HISTORICO_DIR: Joi.string().optional().default('./historico'),
       }),
     }),
 
