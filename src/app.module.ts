@@ -10,7 +10,7 @@ import { PermisosModule } from './permisos/permisos.module';
 import { RolesModule } from './roles/roles.module';
 import { S3Module } from './s3/s3.module';
 import { MailModule } from './mail/mail.module';
-import { SnifferModule } from './sniffer/sniffer.module';
+import { GatewayModule } from './gateway/gateway.module';
 import Joi from 'joi';
 
 @Module({
@@ -31,7 +31,8 @@ import Joi from 'joi';
         AWS_SECRET_ACCESS_KEY: Joi.string().optional().allow(''),
         AWS_S3_BUCKET: Joi.string().optional().allow(''),
         UPLOAD_MAX_SIZE: Joi.string().optional().allow(''),
-        SNIFFER_PORT: Joi.number().optional().default(9001),
+        GATEWAY_PORT: Joi.number().optional().default(9001),
+        GATEWAY_DEBUG_HEX: Joi.boolean().optional().default(false),
       }),
     }),
 
@@ -77,7 +78,7 @@ import Joi from 'joi';
 
     ModulosModule,
 
-    SnifferModule,
+    GatewayModule,
   ],
 })
-export class AppModule { }
+export class AppModule {}
