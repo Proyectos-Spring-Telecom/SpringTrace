@@ -32,7 +32,30 @@ describe('JT808 codec', () => {
       terminalId: '007773050481',
       serialNumber: 8,
       body,
+      headerLength: 12,
+      hasSubpackages: false,
+      packageTotal: undefined,
+      packageNo: undefined,
     });
+  });
+
+  it('parsea cabecera con subpaquetes (bit 13)', () => {
+    const fragment = Buffer.from([0xaa, 0xbb, 0xcc, 0xdd]);
+    const payload = Buffer.alloc(16 + fragment.length);
+    payload.writeUInt16BE(0x0801, 0);
+    payload.writeUInt16BE(0x2000 | fragment.length, 2); // bit 13 + body len
+    Buffer.from('007773050481', 'hex').copy(payload, 4);
+    payload.writeUInt16BE(42, 10);
+    payload.writeUInt16BE(3, 12); // total
+    payload.writeUInt16BE(2, 14); // package no
+    fragment.copy(payload, 16);
+
+    const header = parseHeader(payload);
+    expect(header.hasSubpackages).toBe(true);
+    expect(header.headerLength).toBe(16);
+    expect(header.packageTotal).toBe(3);
+    expect(header.packageNo).toBe(2);
+    expect(header.body).toEqual(fragment);
   });
 
   it('ensambla tramas partidas y varias tramas en un solo chunk', () => {

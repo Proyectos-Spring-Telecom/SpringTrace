@@ -12,6 +12,8 @@ npm-debug.log*
 /capturas
 # Posiciones decodificadas 0x0200
 /historico
+# Fotos JPEG bajo demanda 0x8801/0x0801
+/fotos
 
 pnpm-debug.log*
 yarn-debug.log*

@@ -1,6 +1,7 @@
 const FRAME_DELIMITER = 0x7e;
 const ESCAPE_MARKER = 0x7d;
 const HEADER_LENGTH_2011 = 12;
+const SUBPACKAGE_ITEM_LENGTH = 4;
 const MAX_BODY_LENGTH = 0x03ff;
 
 export interface Jt808Header {
@@ -9,6 +10,13 @@ export interface Jt808Header {
   terminalId: string;
   serialNumber: number;
   body: Buffer;
+  /** Longitud de cabecera (12 sin subpaquetes, 16 con). */
+  headerLength: number;
+  hasSubpackages: boolean;
+  /** Total de paquetes (solo si hasSubpackages). */
+  packageTotal?: number;
+  /** Número de paquete actual, 1-based (solo si hasSubpackages). */
+  packageNo?: number;
 }
 
 /**
@@ -83,7 +91,7 @@ export function calcChecksum(
 
 /**
  * Parsea un mensaje JT/T 808:2011 ya des-escapado y sin delimitadores.
- * Puede recibir header+cuerpo o header+cuerpo+checksum.
+ * Soporta cabecera con ítem de subpaquete (bit 13 de propiedades).
  */
 export function parseHeader(buffer: Buffer): Jt808Header {
   if (buffer.length < HEADER_LENGTH_2011) {
@@ -101,20 +109,33 @@ export function parseHeader(buffer: Buffer): Jt808Header {
   if (encryptionType !== 0) {
     throw new Error(`Cifrado JT808 no soportado: tipo ${encryptionType}`);
   }
-  if (hasSubpackages) {
-    throw new Error('Subpaquetes JT808 no soportados');
+
+  const headerLength = hasSubpackages
+    ? HEADER_LENGTH_2011 + SUBPACKAGE_ITEM_LENGTH
+    : HEADER_LENGTH_2011;
+
+  if (hasSubpackages && buffer.length < headerLength) {
+    throw new Error('Cabecera JT808 con subpaquetes incompleta');
   }
 
-  const expectedLength = HEADER_LENGTH_2011 + bodyLength;
+  const expectedLength = headerLength + bodyLength;
   if (buffer.length < expectedLength) {
     throw new Error(
-      `Cuerpo JT808 incompleto: esperado ${bodyLength}, disponible ${Math.max(0, buffer.length - HEADER_LENGTH_2011)}`,
+      `Cuerpo JT808 incompleto: esperado ${bodyLength}, disponible ${Math.max(0, buffer.length - headerLength)}`,
     );
   }
 
   const terminalId = buffer.subarray(4, 10).toString('hex');
   const serialNumber = buffer.readUInt16BE(10);
-  const body = Buffer.from(buffer.subarray(HEADER_LENGTH_2011, expectedLength));
+  let packageTotal: number | undefined;
+  let packageNo: number | undefined;
+
+  if (hasSubpackages) {
+    packageTotal = buffer.readUInt16BE(12);
+    packageNo = buffer.readUInt16BE(14);
+  }
+
+  const body = Buffer.from(buffer.subarray(headerLength, expectedLength));
 
   return {
     messageId,
@@ -122,10 +143,14 @@ export function parseHeader(buffer: Buffer): Jt808Header {
     terminalId,
     serialNumber,
     body,
+    headerLength,
+    hasSubpackages,
+    packageTotal,
+    packageNo,
   };
 }
 
-/** Construye una trama JT/T 808:2011 completa, escapada y delimitada. */
+/** Construye una trama JT/T 808:2011 completa, escapada y delimitada (sin subpaquetes). */
 export function buildMessage(
   messageId: number,
   terminalId: string,

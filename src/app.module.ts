@@ -37,6 +37,8 @@ import Joi from 'joi';
         GATEWAY_CAPTURE_DIR: Joi.string().optional().default('./capturas'),
         GATEWAY_HISTORICO_ENABLED: Joi.boolean().optional().default(true),
         GATEWAY_HISTORICO_DIR: Joi.string().optional().default('./historico'),
+        GATEWAY_FOTOS_DIR: Joi.string().optional().default('./fotos'),
+        GATEWAY_CAPTURE_TIMEOUT_MS: Joi.number().optional().default(30000),
       }),
     }),
 
